@@ -317,9 +317,12 @@ run_httpx() {
 
             echo "    [$status] $url - $title"
         done < "$HTTPX_JSON_FILE"
+
+        print_fuzzing_target_summary
     else
         echo "[!] No responsive HTTP/HTTPS services found by httpx."
     fi
+
 }
 
 json_value() {
@@ -334,6 +337,122 @@ json_number() {
     local line="$2"
 
     echo "$line" | sed -nE "s/.*\"$key\"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p"
+}
+
+compact_ips_from_file() {
+    local input_file="$1"
+
+    awk -F. '
+    function flush_range() {
+        if (prefix == "") {
+            return
+        }
+
+        if (start == prev) {
+            item = prefix "." start
+        } else {
+            item = prefix "." start "-" prev
+        }
+
+        if (output == "") {
+            output = item
+        } else {
+            output = output "," item
+        }
+    }
+
+    {
+        current_prefix = $1 "." $2 "." $3
+        current_last = $4 + 0
+
+        if (prefix == "") {
+            prefix = current_prefix
+            start = current_last
+            prev = current_last
+            next
+        }
+
+        if (current_prefix == prefix && current_last == prev + 1) {
+            prev = current_last
+            next
+        }
+
+        flush_range()
+
+        prefix = current_prefix
+        start = current_last
+        prev = current_last
+    }
+
+    END {
+        flush_range()
+        print output
+    }
+    ' "$input_file"
+}
+
+print_fuzzing_target_summary() {
+    if [[ ! -s "$HTTPX_JSON_FILE" ]]; then
+        return
+    fi
+
+    local tmp_ips
+    local tmp_ports
+    tmp_ips="$(mktemp)"
+    tmp_ports="$(mktemp)"
+
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+
+        local url
+        url="$(json_value "url" "$line")"
+        [[ -z "$url" ]] && continue
+
+        local host_port
+        local host
+        local port
+
+        host_port="$(echo "$url" | sed -E 's#^https?://##; s#/.*$##')"
+        host="${host_port%%:*}"
+        port="${host_port##*:}"
+
+        if [[ "$host_port" != *":"* ]]; then
+            case "$url" in
+                http://*) port="80" ;;
+                https://*) port="443" ;;
+                *) continue ;;
+            esac
+        fi
+
+        if [[ "$host" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ && "$port" =~ ^[0-9]+$ ]]; then
+            echo "$host" >> "$tmp_ips"
+            echo "$port" >> "$tmp_ports"
+        fi
+
+    done < "$HTTPX_JSON_FILE"
+
+    if [[ ! -s "$tmp_ips" || ! -s "$tmp_ports" ]]; then
+        rm -f "$tmp_ips" "$tmp_ports"
+        return
+    fi
+
+    sort -u -t. -k1,1n -k2,2n -k3,3n -k4,4n "$tmp_ips" -o "$tmp_ips"
+    sort -n -u "$tmp_ports" -o "$tmp_ports"
+
+    local ip_arg
+    local port_arg
+
+    ip_arg="$(compact_ips_from_file "$tmp_ips")"
+    port_arg="$(paste -sd, "$tmp_ports")"
+
+    echo "[+] Copy-paste targets for endpoint fuzzing:"
+    echo "    -t $ip_arg -p $port_arg"
+    echo
+    echo "[+] Example:"
+    echo "    toolbox run ferox-api-endpoint-scan -t $ip_arg -p $port_arg"
+    echo
+
+    rm -f "$tmp_ips" "$tmp_ports"
 }
 
 find_screenshot_for_url() {
