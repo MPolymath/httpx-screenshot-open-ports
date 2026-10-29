@@ -12,6 +12,10 @@
 #   --timeout             Timeout in seconds. Overrides profile timeout.
 #   --profile             quiet, balanced, or fast. Default: balanced
 #   --web-only            Only test ports/services likely to be HTTP/HTTPS.
+#   --proxy <url>         Route httpx through a proxy (e.g. socks5://127.0.0.1:9050).
+#                         Go binaries make direct syscalls and BYPASS proxychains
+#                         LD_PRELOAD, so through a pivot you MUST use this flag
+#                         (or set ALL_PROXY) or httpx connects directly.
 #   -h, --help            Show help message.
 #
 # Examples:
@@ -30,6 +34,7 @@ PROFILE="balanced"
 TIMEOUT=""
 CURL_RESPONSE=false
 WEB_ONLY=false
+PROXY_URL=""
 
 HTTPX_RATE_LIMIT=""
 HTTPX_THREADS=""
@@ -98,6 +103,17 @@ Options:
   --web-only
       Only test ports/services that are likely to be HTTP/HTTPS.
       This reduces noise by avoiding obvious non-web services such as SSH, SMB, RDP, etc.
+
+  --proxy <url>
+      Route $HOME/go/bin/httpx through a proxy.
+      Example: --proxy socks5://127.0.0.1:9050
+
+      IMPORTANT through pivots: Go binaries make direct syscalls and bypass
+      proxychains' LD_PRELOAD hook, so running 'proxychains toolbox run
+      httpx-screenshot-open-ports' silently connects DIRECTLY, outside the
+      tunnel. Use --proxy (or export ALL_PROXY) to route httpx explicitly.
+      Note: screenshots are taken by a local headless browser, which may also
+      connect directly; the --curl-response path uses curl and follows the proxy.
 
   -h, --help
       Show this help message.
@@ -285,6 +301,18 @@ run_httpx() {
     echo "    Text: $HTTPX_TEXT_FILE"
     echo "    Screenshots: $OUTPUT_DIR/screenshots"
 
+    # Go httpx bypasses proxychains LD_PRELOAD, so an explicit -http-proxy is
+    # the only reliable way to route it through a pivot. --proxy wins over
+    # the ALL_PROXY environment fallback.
+    local proxy_args=()
+    if [[ -n "$PROXY_URL" ]]; then
+        proxy_args+=(-http-proxy "$PROXY_URL")
+        echo "[+] Routing httpx through proxy: $PROXY_URL"
+    elif [[ -n "${ALL_PROXY:-}" ]]; then
+        proxy_args+=(-http-proxy "$ALL_PROXY")
+        echo "[+] Routing httpx through ALL_PROXY: $ALL_PROXY"
+    fi
+
     "$HOME/go/bin/httpx" \
         -l "$TARGETS_FILE" \
         -status-code \
@@ -295,6 +323,7 @@ run_httpx() {
         -timeout "$TIMEOUT" \
         -rate-limit "$HTTPX_RATE_LIMIT" \
         -threads "$HTTPX_THREADS" \
+        "${proxy_args[@]}" \
         -screenshot \
         -srd "$OUTPUT_DIR/screenshots" \
         -silent \
@@ -443,6 +472,7 @@ td, th {
 <tr><th>Timeout</th><td><code>$TIMEOUT</code></td></tr>
 <tr><th>Web-only mode</th><td><code>$WEB_ONLY</code></td></tr>
 <tr><th>Curl response capture</th><td><code>$CURL_RESPONSE</code></td></tr>
+<tr><th>httpx proxy</th><td><code>${PROXY_URL:-${ALL_PROXY:-none}}</code></td></tr>
 <tr><th>Generated targets</th><td><code>$(wc -l < "$TARGETS_FILE" | xargs)</code></td></tr>
 </table>
 </div>
@@ -601,6 +631,16 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
 
+        --proxy)
+            PROXY_URL="${2:-}"
+            shift 2
+            ;;
+
+        --proxy=*)
+            PROXY_URL="${1#*=}"
+            shift
+            ;;
+
         -h|--help)
             show_help
             exit 0
@@ -617,6 +657,21 @@ done
 check_dependencies
 validate_options
 apply_profile
+
+# Go binaries make direct syscalls and bypass proxychains' LD_PRELOAD hook.
+# Warn loudly when we appear to be inside a proxychains tunnel without an
+# explicit proxy, because httpx would silently connect outside the tunnel.
+if [[ -n "${LD_PRELOAD:-}" && "${LD_PRELOAD}" == *proxychains* ]]; then
+    if [[ -z "$PROXY_URL" && -z "${ALL_PROXY:-}" ]]; then
+        echo "[!] WARNING: proxychains detected, but Go httpx bypasses LD_PRELOAD."
+        echo "    httpx (and its screenshot browser) will connect DIRECTLY, outside the tunnel."
+        echo "    Re-run with --proxy socks5://127.0.0.1:9050 (or export ALL_PROXY) to route it."
+        echo "    Continuing in 5 seconds..."
+        sleep 5
+    else
+        echo "[*] Proxychains detected with an explicit httpx proxy configured."
+    fi
+fi
 
 mkdir -p "$OUTPUT_DIR"
 mkdir -p "$OUTPUT_DIR/screenshots"
